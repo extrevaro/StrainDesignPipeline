@@ -573,3 +573,109 @@ def plot_fseof_analysis(data, target_reaction, threshold,  regulation_type='U', 
     print('Saving image result as %s ...' % filename)
     fig.write_image(filename)
     return df.columns.tolist()
+
+#this is a initial approach for the MCS constraint generator
+def gc_filtering_constraints_generator(model, target_biomass, target_reaction, carbon_source, growth_fraction,
+                                       yield_from_biomass=2, yield_from_sustrate=0.05):
+    
+    pfba_result = pfba(model)
+    wt_biomass = pfba_result.fluxes[target_biomass]
+    bp_constraint_pattern = '%s >= %s'
+    gc_constraint_pattern = '%s <= %s'
+    minimum_growth_constraint = bp_constraint_pattern % (target_biomass, growth_fraction*wt_biomass)
+    minimum_yield_constraint = bp_constraint_pattern % (target_reaction, 0.001)
+    bioprocess_constraints = [minimum_growth_constraint, minimum_yield_constraint]
+    
+    #SGC requires a yield of the product from the biomass so we are going to impose this yield as a constraint
+    if min(model.reactions.get_by_id(target_reaction).bounds) >= 0:
+        sign = ' - '
+        
+    else:
+        sign = ' + '
+    
+    strong_coupling_constraint = gc_constraint_pattern % (sign.join([target_reaction,
+                                                                     str(yield_from_biomass)+' '+target_biomass]), 0)
+        
+    #WGC requires at least a positive yield of the product from the sustrate, that will be imposed as the constraint
+    if min(model.reactions.get_by_id(target_reaction).bounds) >= 0 and min(model.reactions.get_by_id(carbon_source).bounds) >= 0:
+        sign = ' - '
+    
+    else:
+        sign = ' + '
+            
+    weak_coupling_constraint = gc_constraint_pattern % (sign.join([target_reaction,
+                                                                   str(yield_from_sustrate)+' '+carbon_source]) , 0)
+
+    gc_constraints =  [strong_coupling_constraint, weak_coupling_constraint]
+    
+    constraints = {'bioprocess_constraints' : bioprocess_constraints,
+                   'coupling_constraints' : gc_constraints}
+    
+    return constraints
+
+#IMPLEMENTATION OF THE FUNCTION USED TO ASESS THE FEASIBILITY OF SGC AND WGC
+def check_gc_feasibility(model, constraints):
+    #Module protect contains constraints defining a metabolic space that must remain for the cMCS
+    #In our case this region is the one enabling growth and synthesis above the threshold
+    analysis_data = {'SGC' : [],
+                     'WGC' : [],
+                     'Time': []}
+    
+    module_protect  = sd.SDModule(model,
+                                  sd.names.PROTECT, 
+                                  constraints=constraints['bioprocess_constraints'])
+
+    start = time.time()
+
+    for c in constraints['coupling_constraints']:
+        #Module supress contains constraints defining a metabolic space that should be excluded in the cMCS
+        #Those are specific for the production envelope of the specific bioproduction and the type of GC
+        module_supress = sd.SDModule(model,
+                                     sd.names.SUPPRESS, 
+                                     constraints=[c])
+
+        modules = [module_protect, module_supress]
+        
+        if target_biomass in c :
+            coupling_type = 'SGC'
+        
+        else:
+            coupling_type = 'WGC'
+        
+        try:
+
+            sols = sd.compute_strain_designs(model,
+                                             sd_modules = modules,
+                                             compress = False, #model is already compressed
+                                             max_solutions=1,  #we only need to find 1
+                                             solution_approach='any',
+                                             time_limit=60)
+
+            #‘any’ is usually the fastest option, since optimality is not enforced. Hereby computed MCS are still 
+            #irreducible intervention sets, however, not MCS with the fewest possible number of interventions
+
+            if len(sols.reaction_sd) > 0:
+                print('A cMCS exists so a GC design with specified setup could potentially be found!')
+                analysis_data[coupling_type].append(True)
+                if coupling_type == 'SGC' :
+                    print('A strong GC design is likely to be found')
+
+                print('cMCS are :')
+                for s in sols.reaction_sd:
+                    print(s)
+            else:
+                print('No cMCS was found so GC design with this setup is not possible')
+                analysis_data[coupling_type].append(False)
+        
+        except:
+            print('Python module gives error with constraint "%s"!' % c)
+            analysis_data[coupling_type].append('ERROR')
+
+    end = time.time()
+    analysis_data['Time'].append(end-start)
+    
+    print('All process duration was %s seconds' % (end-start))
+    
+    return pd.DataFrame(analysis_data, index = [model.id])
+
+
