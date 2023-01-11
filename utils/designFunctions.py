@@ -559,9 +559,9 @@ def plot_fseof_analysis(data, target_reaction, threshold,  regulation_type='U', 
         title=dict(text='FSEOF result for '+''.join([m.name for m in target_reaction.metabolites])+' production', x=0.5),
         xaxis=dict(title=' '.join(['Flux',target_reaction.id]), showline=True, linewidth=3.0, linecolor='black',
                    ticks="inside", tickwidth=3.0, tickcolor='black', ticklen=5),
-        yaxis=dict(title='Flux of top coupled reactions', showline=True, linewidth=3.0, linecolor='black',
+        yaxis=dict(title='Top coupled reactions flux', showline=True, linewidth=3.0, linecolor='black',
                    ticks="inside", tickwidth=3.0, tickcolor='black', ticklen=5),
-        font=dict(size=30),
+        font=dict(size=26),
         legend=dict(title='Reactions', font=dict(size=16))
     )
 
@@ -615,6 +615,8 @@ def gc_filtering_constraints_generator(model, target_biomass, target_reaction, c
 
 #IMPLEMENTATION OF THE FUNCTION USED TO ASESS THE FEASIBILITY OF SGC AND WGC
 def check_gc_feasibility(model, constraints):
+    print('The feasibility checking has started, the computing time is highly dependent on model length,')
+    print('so if yor model is up to 1000 reactions this could take several minutes...')
     #Module protect contains constraints defining a metabolic space that must remain for the cMCS
     #In our case this region is the one enabling growth and synthesis above the threshold
     analysis_data = {'SGC' : [],
@@ -624,6 +626,8 @@ def check_gc_feasibility(model, constraints):
     module_protect  = sd.SDModule(model,
                                   sd.names.PROTECT, 
                                   constraints=constraints['bioprocess_constraints'])
+    
+    target_biomass = constraints['bioprocess_constraints'][0].split(' ')[0]
 
     start = time.time()
 
