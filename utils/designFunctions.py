@@ -420,7 +420,6 @@ def analyse_results(set_up_params, model, target_reaction, sorting_param, analys
                             flux_yield = df.loc[df['reactions']== strategy, target_reaction].values[0]
                             biomass = df.loc[df['reactions']== strategy, 'biomass'].values[0]
                             reaction_set |= strategy_set
-                            print(reaction_set)
                             for rxn in strategy_set:
                                 count_dict[rxn] += 1
                                 flux_dict[rxn].append(flux_yield)
@@ -614,7 +613,7 @@ def gc_filtering_constraints_generator(model, target_biomass, target_reaction, c
     return constraints
 
 #IMPLEMENTATION OF THE FUNCTION USED TO ASESS THE FEASIBILITY OF SGC AND WGC
-def check_gc_feasibility(model, constraints):
+def check_gc_feasibility(model, constraints, time_limit):
     print('The feasibility checking has started, the computing time is highly dependent on model length,')
     print('so if yor model is up to 1000 reactions this could take several minutes...')
     #Module protect contains constraints defining a metabolic space that must remain for the cMCS
@@ -653,7 +652,7 @@ def check_gc_feasibility(model, constraints):
                                              compress = False, #model is already compressed
                                              max_solutions=1,  #we only need to find 1
                                              solution_approach='any',
-                                             time_limit=60)
+                                             time_limit=time_limit)
 
             #‘any’ is usually the fastest option, since optimality is not enforced. Hereby computed MCS are still 
             #irreducible intervention sets, however, not MCS with the fewest possible number of interventions

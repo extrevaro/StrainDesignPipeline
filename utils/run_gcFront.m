@@ -12,6 +12,7 @@ experiment=char(table2cell(targetTable(:,1)))
 target=char(table2cell(targetTable(:,2)))
 framework=char(table2cell(targetTable(:,3)))
 biomass_limit=cell2mat(table2cell(targetTable(:,4)))
+production_limit=cell2mat(table2cell(targetTable(:,5))
 
 %SETTING INTERNAL PATHS:
 EXPERIMENT_PATH=strcat(PROJECT_PATH, experiment,'_ko_results/')
@@ -31,7 +32,7 @@ noKOsRxns = setdiff(modelRxns, selectedRxns)
 %NOW WE NEED TO READ THE FILE 'workflow_params.csv', WHERE ALL
 maxKO=30
 minGrowth=biomass_limit
-minProduction=0.1
+minProduction=production_limit
 
 %EVENTUALLY RUN gcFront ALGORITHM
 
