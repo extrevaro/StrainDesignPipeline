@@ -1,19 +1,3 @@
-from cameo.flux_analysis.simulation import lmoma, pfba
-from cameo.strain_design.deterministic.linear_programming import OptKnock
-from cameo.flux_analysis.analysis import phenotypic_phase_plane
-#FSEOF ANALYSIS
-from cameo.visualization.plotting.with_plotly import PlotlyPlotter
-from cameo.strain_design.deterministic.flux_variability_based import FSEOF
-import cobra
-from cobra.sampling import OptGPSampler, ACHRSampler
-from cobra import Reaction
-from cobra.flux_analysis import flux_variability_analysis
-from cobra.flux_analysis.variability import find_essential_genes
-import pandas as pd
-import numpy as np
-import straindesign as sd
-import plotly.express as px
-import plotly.graph_objects as go
 import ast
 import re
 import os
@@ -21,12 +5,43 @@ import sys
 import time
 import random
 
+#import multiprocessing as mp
+import joblib
+import pandas as pd
+import numpy as np
+import straindesign as sd
+import plotly.express as px
+import plotly.graph_objects as go
+
+from cameo.flux_analysis.simulation import lmoma, pfba
+from cameo.strain_design.deterministic.linear_programming import OptKnock
+from cameo.flux_analysis.analysis import phenotypic_phase_plane
+from functools import partial
+
+#FSEOF ANALYSIS
+from cameo.visualization.plotting.with_plotly import PlotlyPlotter
+from cameo.strain_design.deterministic.flux_variability_based import FSEOF
+import cobra
+from cobra.sampling import OptGPSampler, ACHRSampler
+from cobra import Reaction
+from cobra.flux_analysis.variability import find_essential_genes
+
+#GC feasibility
+from scipy.stats import qmc
+
+
 def get_rxn_with_fva_flux(model, fraction_of_objective=0.2, loopless=False):
-    model = model.copy()
+    from cobra.flux_analysis import flux_variability_analysis
+    model_tmp = model.copy()
     #get fva results for all reactions in the model
-    fva_result = cobra.flux_analysis.variability.flux_variability_analysis(model, fraction_of_optimum=fraction_of_objective,  loopless=loopless)
+    print('Performing fva...')
+    fva_result = flux_variability_analysis(model_tmp, fraction_of_optimum=fraction_of_objective,  loopless=loopless)
+    del model_tmp
+    
+    print('Getting reactions from fva')
     #Filter out those reaction tath have min and max fluxes equals to 0:
     rxn_with_flux = fva_result.loc[(fva_result['maximum'] != 0) | (fva_result['minimum'] != 0) ].index.tolist()
+
     return rxn_with_flux
 
 def custom_minimal_media(model, carbon_sources):
@@ -141,6 +156,68 @@ def select_protected_reactions(model, target_biomass, target_reaction, reactions
 
     return set(protected_reactions)
 
+    
+def check_reaction_essentiality_in_parallel(model_settings, r):
+    is_protected_reaction = False
+
+    test_model = model_settings['model']
+    #ensure model has the same constraints as in the definition of model_settings
+    for rxn, bounds in model_settings['model_bounds'].items():
+        test_model.reactions.get_by_id(rxn).bounds = bounds
+        
+    test_model.objective = model_settings['target_biomass']
+
+    test_model.reactions.get_by_id(r.id).bounds = (0,0)
+        
+    try:
+        pfba_result = pfba(test_model)
+        no_flux_biomass = pfba_result[model_settings['target_biomass']] < model_settings['growth_threshold']
+        no_flux_metabolite = pfba_result[model_settings['target_reaction']] < model_settings['minimum_production']
+        
+        if no_flux_biomass or no_flux_metabolite:
+            is_protected_reaction = True
+
+    except Exception as e:
+        print(e)
+        print(r.id)
+        is_protected_reaction = True
+        
+    if is_protected_reaction:
+    	return r.id
+
+       
+
+def select_protected_reactions_in_parallel(model, target_biomass, target_reaction, reactions_to_test=None, flux_fraction=0.1):
+    wt_sol = model.optimize()
+
+    if reactions_to_test:
+        deletion_list = [r for r in model.reactions if r.id in reactions_to_test]
+        
+    else:
+        deletion_list = model.reactions
+    
+    
+    model_settings = { 'model' : model.copy(),
+    			'model_bounds' : {r.id : r.bounds for r in model.reactions},
+                       'target_biomass' : target_biomass,
+                       'target_reaction' : target_reaction,
+                       'growth_threshold' : wt_sol.objective_value*flux_fraction,
+                       'minimum_production' : wt_sol.fluxes[target_reaction]*flux_fraction
+                     }
+
+    #parallelize work
+    print('Parallelizing task..')
+    processes = 4
+    check_model = partial(check_reaction_essentiality_in_parallel, model_settings)    
+    result_list = joblib.Parallel(backend="loky", n_jobs=processes, batch_size=round(len(deletion_list)/processes), verbose=10)(joblib.delayed(check_model)(r) for r in deletion_list)
+                
+    print('End of parallel task!')
+    
+    #delete empty responses from check_model
+    
+    return [r for r in result_list if not r is None]
+
+
 def delete_trasport_reactions(model, rxn_list):
     filtered_list=[]
     for r in rxn_list:
@@ -185,9 +262,9 @@ def find_coupled_reactions(model, reaction_to_test):
 #the consistent model through fastcc
 def get_KO_candidate_list(model, protected_reactions, blocked_reactions=None, carbon_limit=16, epsilon=1e-4, tolerance=1e-7):
     #exclude protected_reactions:
-    candidate_set = set([r.id for r in model.reactions]) - protected_reactions
+    candidate_set = set([r.id for r in model.reactions]) - set(protected_reactions)
     #exclude blocked reactions
-    if not blocked_reactions:
+    if blocked_reactions is None:
         blocked_reactions = Fastcore.fast_find_blocked(model, epsilon=epsilon, tolerance=tolerance)
     candidate_set = candidate_set - blocked_reactions
     #exclude non GPR, exchange and spontaneous reactions
@@ -251,7 +328,7 @@ def generate_strategies(set_up_params, configured_model, target_biomass, target_
         essential_df = pd.read_csv(essential_gene_filepath, header=None)
     except IOError:
         print("File not accessible, computing process esential reactions...")
-        essential_rxns = select_protected_reactions(configured_model, target_biomass, target_reaction)
+        essential_rxns = select_protected_reactions_in_parallel(configured_model, target_biomass, target_reaction)
         pd.DataFrame.from_dict({'Reaction_id': list(essential_rxns)}).to_csv(essential_gene_filepath, index=False)
         #make directory for the project inside the current directory:
         if not os.path.isdir(project_path):
@@ -364,13 +441,17 @@ def flux_sampling_screening(comb_deletions, df, model, target_biomass, target_re
         test_model = model.copy()
         mut_name = '-'.join(del_comb)
         for deletion in del_comb:
-            test_model.reactions.get_by_id(deletion).knock_out()
+            if '-' in deletion:
+            	for rxn_del in deletion.split('-'):
+            	    test_model.reactions.get_by_id(rxn_del).knock_out()
+            else:
+            	test_model.reactions.get_by_id(deletion).knock_out()
             
         #To ensure flux sampling results have a minimum biomass of 20% of wt,
         #change the lower bound to this value
         test_model.reactions.get_by_id(target_biomass).bounds = (growth_threshold, 1000)
         try:
-            optgp = OptGPSampler(test_model, processes=8, thinning=1000)
+            optgp = OptGPSampler(test_model, processes=32, thinning=1000)
             data = optgp.sample(5600)
             data_dict = {target_biomass : data[target_biomass], 
                          target_reaction : data[target_reaction],
@@ -574,111 +655,303 @@ def plot_fseof_analysis(data, target_reaction, threshold,  regulation_type='U', 
     return df.columns.tolist()
 
 #this is a initial approach for the MCS constraint generator
-def gc_filtering_constraints_generator(model, target_biomass, target_reaction, carbon_source, growth_fraction,
-                                       yield_from_biomass=2, yield_from_sustrate=0.05):
+def gc_filtering_constraints_generator(model, target_biomass, target_reaction, carbon_source, product_yield, growth_yield):
+
+    if min(model.reactions.get_by_id(target_reaction).bounds) >= 0 and min(model.reactions.get_by_id(carbon_source).bounds) >= 0:
+    	supress_constraint_pattern = '%f %s - %s <= 0'
+    	protect_constraint_pattern = '%f %s - %s >= 0'
     
-    pfba_result = pfba(model)
-    wt_biomass = pfba_result.fluxes[target_biomass]
-    bp_constraint_pattern = '%s >= %s'
-    gc_constraint_pattern = '%s <= %s'
-    minimum_growth_constraint = bp_constraint_pattern % (target_biomass, growth_fraction*wt_biomass)
-    minimum_yield_constraint = bp_constraint_pattern % (target_reaction, 0.001)
+    else:
+    	supress_constraint_pattern = '%f %s + %s <= 0'
+    	protect_constraint_pattern = '%f %s + %s >= 0'    	
+    
+    minimum_growth_constraint = protect_constraint_pattern % (growth_yield, carbon_source, target_biomass)
+    minimum_yield_constraint = supress_constraint_pattern % (product_yield, carbon_source, target_reaction)
     bioprocess_constraints = [minimum_growth_constraint, minimum_yield_constraint]
     
-    #SGC requires a yield of the product from the biomass so we are going to impose this yield as a constraint
-    if min(model.reactions.get_by_id(target_reaction).bounds) >= 0:
-        sign = ' - '
-        
-    else:
-        sign = ' + '
-    
-    strong_coupling_constraint = gc_constraint_pattern % (sign.join([target_reaction,
-                                                                     str(yield_from_biomass)+' '+target_biomass]), 0)
-        
-    #WGC requires at least a positive yield of the product from the sustrate, that will be imposed as the constraint
-    if min(model.reactions.get_by_id(target_reaction).bounds) >= 0 and min(model.reactions.get_by_id(carbon_source).bounds) >= 0:
-        sign = ' - '
-    
-    else:
-        sign = ' + '
-            
-    weak_coupling_constraint = gc_constraint_pattern % (sign.join([target_reaction,
-                                                                   str(yield_from_sustrate)+' '+carbon_source]) , 0)
-
-    gc_constraints =  [strong_coupling_constraint, weak_coupling_constraint]
-    
-    constraints = {'bioprocess_constraints' : bioprocess_constraints,
-                   'coupling_constraints' : gc_constraints}
+    constraints = {'bioprocess_constraints' : bioprocess_constraints}
     
     return constraints
 
-#IMPLEMENTATION OF THE FUNCTION USED TO ASESS THE FEASIBILITY OF SGC AND WGC
-def check_gc_feasibility(model, constraints, time_limit):
+def gc_filtering_limit_constraints_generator(target_biomass, target_reaction, product_yield, growth_limit):
+
+    supress_constraint_pattern = '%s <= %f'
+    protect_constraint_pattern = '%s >= %f'	
+    
+    minimum_growth_constraint = protect_constraint_pattern % (target_biomass, abs(growth_limit))
+    minimum_yield_constraint = supress_constraint_pattern % (target_reaction, abs(product_yield))
+    bioprocess_constraints = [minimum_growth_constraint, minimum_yield_constraint]
+    
+    constraints = {'bioprocess_constraints' : bioprocess_constraints}
+    
+    return constraints
+
+#<IMPLEMENTATION OF THE FUNCTION USED TO ASESS THE FEASIBILITY OF SGC AND WGC
+def check_gc_feasibility(model, constraints, time_limit, deletion_limit, candidate_list=None, return_mcs=False, filter_essential=True, filter_transports=True):
     print('The feasibility checking has started, the computing time is highly dependent on model length,')
     print('so if yor model is up to 1000 reactions this could take several minutes...')
     #Module protect contains constraints defining a metabolic space that must remain for the cMCS
     #In our case this region is the one enabling growth and synthesis above the threshold
-    analysis_data = {'SGC' : [],
-                     'WGC' : [],
+    analysis_data = {'GC' : [],
                      'Time': []}
+                     
+    #StrainDesign.SDModule has an issue when handling exchange reaction IDs in previous nomenclature (i.e EX_{met}_({compartment}) )
+    #returning "Expression invalid. Unknown identifier EX_{met}({compartment" meaning that deletes the last parenthesis
+    #to avoid this transform reaction in the case it is in the precious nomenclature.
+    test_model = model.copy()
+    pattern = r"\w{1,}\([(\w)]\)"
     
-    module_protect  = sd.SDModule(model,
-                                  sd.names.PROTECT, 
-                                  constraints=constraints['bioprocess_constraints'])
+    protect_constraint = constraints['bioprocess_constraints'][0]
+    target_biomass = protect_constraint.split(' ')[0]
+    supress_constraint = constraints['bioprocess_constraints'][1]
+    target_reaction = supress_constraint.split(' ')[0]
+    #change name for reactions holding parenthesis in name as they produce an error in strain design internal code
+    for i in range(len(constraints['bioprocess_constraints'])):
+    	for match in re.findall(pattern, constraints['bioprocess_constraints'][i]):
+    	    new_rxn_name = match[:-3]+"_e"
+    	    test_model.reactions.get_by_id(match).id = new_rxn_name
+                                 
+    	    if i == 0:
+                protect_constraint = protect_constraint.replace(match, new_rxn_name)
+                
+    	    if i == 1:
+                supress_constraint = supress_constraint.replace(match, new_rxn_name)
+                target_reaction = target_reaction.replace(match, new_rxn_name)
+                
+    module_protect = sd.SDModule(test_model, sd.names.PROTECT, constraints=protect_constraint)
+    module_supress = sd.SDModule(test_model, sd.names.SUPPRESS, constraints=supress_constraint)
     
-    target_biomass = constraints['bioprocess_constraints'][0].split(' ')[0]
+    if candidate_list is None:                                  
+    
+        if filter_essential:    
+    	    protected_reactions = select_protected_reactions_in_parallel(test_model, target_biomass, target_reaction)
+    
+        else:    
+    	    protected_reactions = set()
+    	
+        candidate_set = set([r.id for r in test_model.reactions]) - set(protected_reactions)
 
+        #exclude non GPR, exchange and spontaneous reactions 
+        candidate_list = [ r for r in candidate_set if
+                          test_model.reactions.get_by_id(r).gene_reaction_rule != '' and #Non GPR
+                          len(test_model.reactions.get_by_id(r).metabolites) > 1 and     #Exchange
+                          'spontaneous' not in test_model.reactions.get_by_id(r).name ]  #Spontaneous
+                       
+        if filter_transports:
+    	    #exclude transport reactions    
+    	    candidate_list = delete_trasport_reactions(test_model, candidate_list)
+        
     start = time.time()
 
-    for c in constraints['coupling_constraints']:
-        #Module supress contains constraints defining a metabolic space that should be excluded in the cMCS
-        #Those are specific for the production envelope of the specific bioproduction and the type of GC
-        module_supress = sd.SDModule(model,
-                                     sd.names.SUPPRESS, 
-                                     constraints=[c])
+    try:
 
-        modules = [module_protect, module_supress]
-        
-        if target_biomass in c :
-            coupling_type = 'SGC'
-        
+        sols = sd.compute_strain_designs(test_model,
+                                         sd_modules = [module_protect, module_supress],
+                                         compress = False, #model is already compressed
+                                         max_solutions=1,  #we only need to find 1
+                                         max_cost = deletion_limit, #we assume a maximum of 30 deletions
+                                         ko_cost = {r : 1 for r in candidate_list}, #we only assume the deletion of reactions with associated genes
+                                         solution_approach='any',
+                                         time_limit=time_limit)
+
+        #‘any’ is usually the fastest option, since optimality is not enforced. Hereby computed MCS are still 
+        #irreducible intervention sets, however, not MCS with the fewest possible number of interventions
+
+        if len(sols.reaction_sd) > 0:
+            print('A cMCS exists so a GC design with specified setup and within %s deletions could potentially be found!' %  deletion_limit)
+            analysis_data['GC'].append(True)
+
+            print('cMCS are :')
+            
+            for s in sols.reaction_sd:
+                print(s)
+
         else:
-            coupling_type = 'WGC'
+            print('No cMCS was found so GC design with this setup is not possible')
+            analysis_data['GC'].append(False)
         
-        try:
-
-            sols = sd.compute_strain_designs(model,
-                                             sd_modules = modules,
-                                             compress = False, #model is already compressed
-                                             max_solutions=1,  #we only need to find 1
-                                             solution_approach='any',
-                                             time_limit=time_limit)
-
-            #‘any’ is usually the fastest option, since optimality is not enforced. Hereby computed MCS are still 
-            #irreducible intervention sets, however, not MCS with the fewest possible number of interventions
-
-            if len(sols.reaction_sd) > 0:
-                print('A cMCS exists so a GC design with specified setup could potentially be found!')
-                analysis_data[coupling_type].append(True)
-                if coupling_type == 'SGC' :
-                    print('A strong GC design is likely to be found')
-
-                print('cMCS are :')
-                for s in sols.reaction_sd:
-                    print(s)
-            else:
-                print('No cMCS was found so GC design with this setup is not possible')
-                analysis_data[coupling_type].append(False)
-        
-        except:
-            print('Python module gives error with constraint "%s"!' % c)
-            analysis_data[coupling_type].append('ERROR')
+    except Exception as e:
+        print(e)
+        print('Python module gives error with constraints: "%s"!' % ' and '.join([module_protect, module_supress]))
+        analysis_data['GC'].append('ERROR')
 
     end = time.time()
     analysis_data['Time'].append(end-start)
     
     print('All process duration was %s seconds' % (end-start))
     
-    return pd.DataFrame(analysis_data, index = [model.id])
+    if return_mcs and len(sols.reaction_sd)>0:
+    	analysis_data['MCS'] = sols.reaction_sd
+    	
+    else:
+    	analysis_data['MCS'] = [None]
+    
+    return pd.DataFrame(analysis_data, index = [target_reaction])
+    
+def max_n_ones(binary_iterable, n):
+    '''
+    arguments:
+        - binary_table : a list containing 0s and 1s
+        - n : maximum number of 1s that thr out_bin should have
+        
+    output:
+        - out_bin : the resulting list containing a maximum of n 1s and len-n 0s
+        - string representing out_dir
+    '''
+    ones_n = sum(binary_iterable)
+    indexes = set()
+    
+    # check if input list meet criteria
+    if ones_n <= n:
+        #if meets criteria return binary table
+        out_bin = binary_iterable
+        
+    #if does not meet criteria
+    else:
+        # compute randomly the number of index to edit from the minimum to meet the criteria
+        # (ones_n-n) to the total number of 1s in list (ones_n) 
+        n_of_index_to_edit = random.randint(ones_n-n, ones_n-1)
+        # get random 'n_of_index_to_edit' indexes from all the indexes with value 1
+        idxs_to_edit = random.sample([i for i in range(len(binary_iterable)) if binary_iterable[i]==1],
+                                     n_of_index_to_edit)
+        
+        # compute out_bin by setting to 0 the selected indexes
+        out_bin = [ 0 if i in idxs_to_edit else binary_iterable[i]
+                   for i in range(len(binary_iterable)) ]
+    try:
+           
+        return out_bin, int(''.join([ str(int(d)) for d in out_bin]), 2)
+    
+    except Exception as e:
+        print(e)
+        print(out_bin)
+        print(binary_iterable)
 
+
+def gc_filter_check(model_setup, constraints, objective_function, evaluations=5000, threads=6):
+
+    n_particles = int(evaluations/100)
+    
+    #Initialize sample with Latin Hypercube Sampling
+    sampler = qmc.LatinHypercube(d=len(model_setup['reaction_list']))
+    samples = sampler.integers(l_bounds=0, u_bounds=2, n=n_particles)
+    samples = [np.array(max_n_ones(list(sd), constraints['max_deletions'])[0]) for sd in samples]
+    
+    # Set the options for the PSO algorithm
+    options = {'c1': 2.0, #cognitive parameter -> favours exploitation
+               'c2': 2.0, #social parameter -> favours exploration
+               'w': 1.0,  #inertia parameter -> module the intensity of c1 and c2
+               'k': n_particles/2,   #neighbors to be considered -> to consider the global minima of the group
+               'p': 1
+              }
+                
+    #Set up optimizer parameters
+    optimizer_setup = {'iterations': 100,
+    			'n_particles' : n_particles,
+    			'dimensions': len(model_setup['reaction_list']),
+    			'pso_options': options,
+    			'samples_pos': np.array([max_n_ones(list(sd), constraints['max_deletions'])[0] for sd in samples]),
+    			'threads' : threads}
+        
+    optimizer = BinaryPSO(n_particles=optimizer_setup['n_particles'],
+                          dimensions=optimizer_setup['dimensions'],
+                          options=optimizer_setup['pso_options'],
+                          init_pos=optimizer_setup['samples_pos'])
+        
+    cost, pos = optimizer.optimize(objective_function, iters=optimizer_setup['iterations'], n_processes=optimizer_setup['threads'])
+    
+    return cost<0
+    
+def generate_rand_bin_array_pop(N, max_ones, sample_n):
+    result = []
+    
+    for i in range(sample_n):
+        n_ones = random.randint(0, max_ones)
+        arr = np.zeros(N)
+        arr[:n_ones]  = 1
+        
+        np.random.shuffle(arr)
+        result.append(arr)
+        
+    return np.array(result).astype(int)
+    
+def gc_filter_check_random(model_setup, constraints, objective_function, evaluations=5000, threads=6):
+
+    n_particles = int(evaluations/100)
+    
+    #Initialize sample with Random Sampling
+    samples = generate_rand_bin_array_pop(len(model_setup['reaction_list']),
+                                          constraints['max_deletions'],
+                                          n_particles)
+    
+    # Set the options for the PSO algorithm
+    options = {'c1': 1.0, #cognitive parameter -> favours exploitation
+               'c2': 2.0, #social parameter -> favours exploration
+               'w': 1.0,  #inertia parameter -> module the intensity of c1 and c2
+               'k': n_particles/2,   #neighbors to be considered -> to consider the global minima of the group
+               'p': 1
+              }
+                
+    #Set up optimizer parameters
+    optimizer_setup = {'iterations': 100,
+    			'n_particles' : n_particles,
+    			'dimensions': len(model_setup['reaction_list']),
+    			'pso_options': options,
+    			'samples_pos': samples,
+    			'threads' : threads}
+        
+    optimizer = BinaryPSO(n_particles=optimizer_setup['n_particles'],
+                          dimensions=optimizer_setup['dimensions'],
+                          options=optimizer_setup['pso_options'],
+                          init_pos=optimizer_setup['samples_pos'])
+        
+    cost, pos = optimizer.optimize(objective_function, iters=optimizer_setup['iterations'], n_processes=optimizer_setup['threads'])
+    
+    return cost<0
+
+
+def add_missing_reactions(model, repository_model, carbon_source, product):
+    
+    try:
+        repository_model.objective = {repository_model.reactions.get_by_id(product) : 1}
+        fba = repository_model.optimize()
+                
+        reactions_to_synthetize_product = [r.id for r in repository_model.reactions if fba.fluxes[r.id]!=0]          
+        reactions_to_add = set(reactions_to_synthetize_product)-set([r.id for r in model.reactions])
+        
+        if len(reactions_to_add) == 0:
+            edited_model = model
+            feasible = 0
+            print('Repository model have no extra reactions to aid in the bioprocess!')
+            
+        else:
+            edited_model = model.copy()
+            edited_model.add_reactions([r for r in repository_model.reactions if r.id in reactions_to_add])
+            edited_model.objective = {edited_model.reactions.get_by_id(product) : 1}
+            feasible = edited_model.slim_optimize() > 0
+            
+    except Exception as e:
+        print(e)
+        edited_model = model
+        feasible = False
+        print('Metabolite %s, used as a product it is not present in repository model or cannot be produced!' % product)
+        
+    return edited_model, feasible
+    
+def fva_analysis(model, generate_plot=True):
+    from cobra.flux_analysis import flux_variability_analysis
+    fva_result = flux_variability_analysis(model, fraction_of_optimum=0.1, loopless=True)
+    fva_result = fva_result.loc[(fva_result['minimum']!=0)|(fva_result['maximum']!=0)]
+    fva_result['range'] = fva_result['maximum'] - fva_result['minimum']
+    fva_result = fva_result.sort_values(by='range', ascending=False)
+    
+    if generate_plot:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=x, y=fva_result.minimum, name='minimum'))
+        fig.add_trace(go.Bar(x=x, y=fva_result.maximum, name='maximum'))
+        fig.update_layout(template='plotly_white', barmode='relative')
+        fig.show()
+        fig.write_image('fva_analysis_plot.svg')
+    
+    return fva_result
 
